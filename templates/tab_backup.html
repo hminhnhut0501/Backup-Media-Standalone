@@ -1,0 +1,413 @@
+<section x-data="backupController()" x-init="bindTabLifecycle($data, 'backup', $watch, activeTab); start()" x-show="activeTab === 'backup'" class="backup-root" style="display:none" x-transition.opacity>
+  <div class="backup-layout">
+    <aside class="panel composer">
+      <div class="panel-head">
+        <h2>Trình tạo job backup</h2>
+      </div>
+
+      <div class="panel-body">
+        <label class="field">
+          <span>Tên job</span>
+          <input x-model="form.name" class="input-field" placeholder="VD: Backup topic A" />
+        </label>
+
+        <div class="field-grid two">
+          <label class="field">
+            <span>Link bắt đầu</span>
+            <input x-model="form.start_link" class="input-field" />
+          </label>
+          <label class="field">
+            <span>Link kết thúc</span>
+            <input x-model="form.end_link" class="input-field" />
+          </label>
+        </div>
+
+        <label class="field">
+          <span>Đích</span>
+          <input x-model="form.target_link" list="targets-backup" class="input-field" />
+          <datalist id="targets-backup">
+            <template x-for="t in savedTargets" :key="t"><option :value="t"></option></template>
+          </datalist>
+        </label>
+
+        <div class="field-grid two">
+          <label class="field">
+            <span>Lọc media</span>
+            <select x-model="form.media_filter" class="input-field">
+              <option value="all">Tất cả</option>
+              <option value="video">Video</option>
+              <option value="photo">Ảnh</option>
+              <option value="document">Document</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Chế độ caption</span>
+            <select x-model="form.caption_mode" class="input-field">
+              <option value="source">Nguồn</option>
+              <option value="custom">Tùy chỉnh</option>
+              <option value="both">Tùy chỉnh + nguồn</option>
+              <option value="none">Không caption</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="field-grid two">
+          <label class="field"><span>Batch</span><input type="number" min="1" max="1000" x-model.number="form.batch_limit" class="input-field" /></label>
+          <label class="field"><span>Retry</span><input type="number" min="1" max="8" x-model.number="form.upload_retry_max" class="input-field" /></label>
+        </div>
+
+        <label class="field">
+          <span>Caption tùy chỉnh</span>
+          <textarea x-model="form.caption" rows="3" class="input-field"></textarea>
+        </label>
+
+        <div class="field-grid two">
+          <label class="field"><span>Delay min</span><input type="number" min="0" step="0.5" x-model.number="form.delay_min" class="input-field" /></label>
+          <label class="field"><span>Delay max</span><input type="number" min="0" step="0.5" x-model.number="form.delay_max" class="input-field" /></label>
+        </div>
+
+        <div class="toggle-row">
+          <button type="button" @click="form.stop_on_error=!form.stop_on_error" class="toggle-btn" :class="form.stop_on_error ? 'on-danger' : ''">Dừng khi lỗi</button>
+          <button type="button" @click="form.fast_download=!form.fast_download" class="toggle-btn" :class="form.fast_download ? 'on-good' : ''">Tải nhanh</button>
+        </div>
+
+        <div class="advanced-box">
+          <button type="button" class="ghost-btn" @click="showAdvancedBuilder = !showAdvancedBuilder">Cài đặt nâng cao</button>
+          <div x-show="showAdvancedBuilder" class="field-grid two" style="display:none; margin-top:12px;">
+            <label class="field"><span>DL workers</span><input type="number" min="1" max="8" x-model.number="form.download_workers" class="input-field" /></label>
+            <label class="field"><span>UL workers</span><input type="number" min="1" max="2" x-model.number="form.upload_workers" class="input-field" /></label>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel-foot">
+        <button @click="addJob" class="tv-btn tv-btn-success">Tạo job</button>
+        <button @click="cleanup" class="tv-btn tv-btn-secondary">Dọn temp</button>
+      </div>
+    </aside>
+
+    <section class="panel board">
+      <div class="board-toolbar">
+        <h3>Jobs board</h3>
+        <div class="actions">
+          <div class="status-pill">Poll: <span :class="pollError ? 'text-bad' : 'text-good'" x-text="pollError ? ('ERR '+pollError) : 'OK'"></span></div>
+          <button @click="refresh" class="tv-btn tv-btn-secondary">Làm mới</button>
+          <button @click="startQueue" class="tv-btn tv-btn-info">Chạy hàng đợi</button>
+          <button @click="stopQueue" class="tv-btn tv-btn-warning">Dừng hàng đợi</button>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <article class="kpi-card"><p>Đang chạy</p><strong x-text="kpi.runningJobs"></strong></article>
+        <article class="kpi-card"><p>Chờ xử lý</p><strong x-text="kpi.pendingItems"></strong></article>
+        <article class="kpi-card"><p>Đã upload</p><strong x-text="kpi.totalUploaded"></strong></article>
+        <article class="kpi-card"><p>Sức khỏe</p><strong :class="kpi.health==='Blocked' ? 'text-bad' : (kpi.health==='Degraded' ? 'text-warn' : 'text-good')" x-text="kpi.health"></strong></article>
+      </div>
+
+      <div class="filter-row">
+        <div class="filter-tabs">
+          <button @click="setFilter('all')" :class="jobFilter==='all' ? 'active' : ''">Tất cả <span x-text="filterCount.all"></span></button>
+          <button @click="setFilter('running')" :class="jobFilter==='running' ? 'active' : ''">Đang chạy <span x-text="filterCount.running"></span></button>
+          <button @click="setFilter('error')" :class="jobFilter==='error' ? 'active' : ''">Lỗi <span x-text="filterCount.error"></span></button>
+          <button @click="setFilter('done')" :class="jobFilter==='done' ? 'active' : ''">Hoàn tất <span x-text="filterCount.done"></span></button>
+        </div>
+        <input x-model="searchText" placeholder="Tìm job..." class="input-field search" />
+      </div>
+
+      <div class="jobs-list custom-scroll">
+        <template x-for="j in filteredJobs" :key="j.id">
+          <article @click="openDrawer(j)" class="job-card">
+            <div class="job-head">
+              <div>
+                <h4 x-text="j.name"></h4>
+                <p x-text="j.status"></p>
+              </div>
+              <div class="job-actions">
+                <span x-text="jobProgress(j) + '%' "></span>
+                <button @click.stop="remove(j.id)" class="danger-mini" title="Xoá job">Xoá</button>
+              </div>
+            </div>
+            <p class="job-meta">xong <b x-text="j.uploaded_count"></b> · lỗi <b x-text="j.error_count"></b> · cuối <b x-text="j.last_processed_id"></b></p>
+            <div class="progress-track"><div class="progress-fill" :style="`width:${jobProgress(j)}%`"></div></div>
+          </article>
+        </template>
+      </div>
+    </section>
+  </div>
+
+  <div x-show="drawerOpen" style="display:none" class="drawer-overlay" @click.self="drawerOpen=false">
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <div>
+          <p>Chi tiết job</p>
+          <h3 x-text="selectedJob?.name || ''"></h3>
+        </div>
+        <div class="actions">
+          <button @click="run(selectedJob.id)" class="tv-btn tv-btn-success">Run</button>
+          <button @click="pause(selectedJob.id)" class="tv-btn tv-btn-warning">Pause</button>
+          <button @click="drawerOpen=false" class="tv-btn tv-btn-secondary">Đóng</button>
+        </div>
+      </div>
+
+      <div class="drawer-tabs">
+        <button @click="drawerTab='downloading'" :class="drawerTab==='downloading' ? 'active' : ''">Đang tải (<span x-text="tabRows.downloading.length"></span>)</button>
+        <button @click="drawerTab='uploading'" :class="drawerTab==='uploading' ? 'active' : ''">Đang upload (<span x-text="tabRows.uploading.length"></span>)</button>
+        <button @click="drawerTab='queue'" :class="drawerTab==='queue' ? 'active' : ''">Hàng đợi (<span x-text="tabRows.queue.length"></span>)</button>
+        <button @click="drawerTab='logs'" :class="drawerTab==='logs' ? 'active' : ''">Nhật ký</button>
+        <button @click="drawerTab='settings'" :class="drawerTab==='settings' ? 'active' : ''">Cài đặt</button>
+      </div>
+
+      <div class="drawer-body custom-scroll">
+        <div x-show="drawerTab!=='settings' && drawerTab!=='logs'" style="display:none">
+          <div class="kpi-grid small">
+            <article class="kpi-card"><p>State</p><strong x-text="selectedJob?.status || '-' "></strong></article>
+            <article class="kpi-card"><p>Processed</p><strong x-text="selectedJob?.processed_count || 0"></strong></article>
+            <article class="kpi-card"><p>Uploaded</p><strong x-text="selectedJob?.uploaded_count || 0"></strong></article>
+            <article class="kpi-card"><p>Lỗi</p><strong x-text="selectedJob?.error_count || 0"></strong></article>
+          </div>
+
+          <div class="kpi-grid small" style="margin-top:12px;">
+            <article class="kpi-card"><p>Queue</p><strong x-text="queueItems?.stats?.total || 0"></strong></article>
+            <article class="kpi-card"><p>In Progress</p><strong x-text="queueItems?.stats?.in_progress || 0"></strong></article>
+            <article class="kpi-card"><p>Pending</p><strong x-text="queueItems?.stats?.pending || 0"></strong></article>
+            <article class="kpi-card"><p>Done</p><strong x-text="queueItems?.stats?.done || 0"></strong></article>
+          </div>
+
+          <div class="panel-soft" x-show="drawerTab==='downloading' || drawerTab==='uploading'" style="display:none; margin-top:14px;">
+            <p class="label">Pipeline</p>
+            <div class="progress-track"><div class="progress-fill" :style="`width:${selectedJob ? jobProgress(selectedJob) : 0}%`"></div></div>
+            <p class="meta">Action: <b x-text="selectedRuntime?.action || '-' "></b> · Msg: <b x-text="selectedRuntime?.current_message_id || '-' "></b></p>
+            <p class="meta">DL: <b x-text="`${Number(selectedRuntime?.download_speed_mbps || 0).toFixed(2)} MB/s`"></b> · UL: <b x-text="`${Number(selectedRuntime?.upload_speed_mbps || 0).toFixed(2)} MB/s`"></b></p>
+          </div>
+
+          <div class="panel-soft" style="margin-top:14px;">
+            <div class="list-head"><p>Transfer center</p><span x-text="drawerTab.toUpperCase()"></span></div>
+            <div class="queue-list">
+              <template x-if="activeRows.length===0"><p class="empty">Không có task ở tab này.</p></template>
+              <template x-for="it in activeRows" :key="`${drawerTab}-${it.seq}-${it.source_message_id}`">
+                <article class="queue-item">
+                  <div class="queue-row">
+                    <p>#<span x-text="it.seq"></span> · <b x-text="it.source_message_id"></b> · <span x-text="it.media_kind"></span></p>
+                    <span class="chip" x-text="it.sub_state || it.state"></span>
+                  </div>
+                  <div class="progress-track"><div class="progress-fill" :style="`width:${Number(it.sub_progress || 0)}%`"></div></div>
+                </article>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <div x-show="drawerTab==='logs'" style="display:none" class="panel-soft">
+          <div class="list-head">
+            <p>Realtime logs</p>
+            <button @click="selectedJob && loadLogs(selectedJob.id)" class="tv-btn tv-btn-secondary">Làm mới log</button>
+          </div>
+          <div class="queue-list">
+            <template x-if="!logs || logs.length===0"><p class="empty">Chưa có log cho job này.</p></template>
+            <template x-for="(l, idx) in logs" :key="`log-${idx}-${l.ts || ''}`">
+              <article class="log-item">
+                <p><span x-text="l.ts || '-'"></span> · <b x-text="l.level || 'info'"></b> · <b x-text="l.stage || '-'"></b></p>
+                <p x-text="l.message || '-'"></p>
+              </article>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="drawerTab==='settings'" style="display:none">
+          <div class="field-grid two">
+            <label class="field"><span>Batch</span><input type="number" x-model.number="settingsForm.batch_limit" class="input-field" /></label>
+            <label class="field"><span>Upload Retry</span><input type="number" x-model.number="settingsForm.upload_retry_max" class="input-field" /></label>
+            <label class="field"><span>DL workers</span><input type="number" x-model.number="settingsForm.download_workers" class="input-field" /></label>
+            <label class="field"><span>UL workers</span><input type="number" x-model.number="settingsForm.upload_workers" class="input-field" /></label>
+            <label class="field"><span>Delay min</span><input type="number" step="0.5" x-model.number="settingsForm.delay_min" class="input-field" /></label>
+            <label class="field"><span>Delay max</span><input type="number" step="0.5" x-model.number="settingsForm.delay_max" class="input-field" /></label>
+          </div>
+          <div class="toggle-row" style="margin-top:12px;">
+            <button type="button" @click="settingsForm.stop_on_error=!settingsForm.stop_on_error" class="toggle-btn" :class="settingsForm.stop_on_error ? 'on-danger' : ''">Stop on error</button>
+            <button type="button" @click="settingsForm.fast_download=!settingsForm.fast_download" class="toggle-btn" :class="settingsForm.fast_download ? 'on-good' : ''">Fast download</button>
+          </div>
+          <button @click="saveSettings" class="tv-btn tv-btn-info" style="margin-top:14px;">Lưu settings job</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+document.addEventListener('alpine:init', () => {
+    Alpine.data('backupController', () => ({
+        form: { name:'', start_link:'', end_link:'', target_link:'', media_filter:'all', caption_mode:'source', caption:'', batch_limit:50, delay_min:1, delay_max:3, stop_on_error:false, fast_download:true, upload_retry_max:3, download_workers:4, upload_workers:1 },
+        showAdvancedBuilder: false,
+        jobs: [], runtime: {}, previewData: {}, savedTargets: [],
+        telemetry: [], telemetryJobId: null, logs: [], logsJobId: null,
+        diagnostics: null,
+        metrics: null,
+        queueItems: { stats:{pending:0,in_progress:0,done:0,error:0,total:0}, items:[] },
+        queue: { running:false, current_job_id:null, queued_job_ids:[], queued_count:0 },
+        kpi: { runningJobs:0, pendingItems:0, totalUploaded:0, health:'Stable' },
+        jobFilter: 'all', searchText: '', filterCount: { all:0, running:0, error:0, done:0 },
+        drawerOpen:false, drawerTab:'downloading', selectedJob:null, settingsForm:{},
+        timer: null,
+        watchdogTimer: null,
+        polling: false,
+        lastPollAt: 0,
+        pollError: '',
+        async fetchJson(url){
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 8000);
+            try{
+                const r = await fetch(url, { cache:'no-store', signal: controller.signal });
+                if(!r.ok) throw new Error(`HTTP ${r.status}`);
+                return await r.json();
+            } finally {
+                clearTimeout(t);
+            }
+        },
+        async safePoll(){
+            if(this.polling) return;
+            this.polling = true;
+            try{
+                await this.refresh();
+                await this.pollRuntime();
+                await this.pollQueue();
+                if(this.drawerOpen && this.selectedJob){
+                    await Promise.all([
+                        this.loadLogs(this.selectedJob.id),
+                        this.loadTelemetry(this.selectedJob.id),
+                        this.loadDiagnostics(this.selectedJob.id),
+                        this.loadMetrics(this.selectedJob.id),
+                        this.loadQueueItems(this.selectedJob.id),
+                    ]);
+                }
+                this.lastPollAt = Date.now();
+                this.pollError = '';
+            }catch(e){
+                this.pollError = (e && e.message) ? e.message : 'poll_failed';
+            } finally {
+                this.polling = false;
+            }
+        },
+        start(){
+            if(this.timer || this.watchdogTimer) return;
+            this.fetchTargets();
+            const tick = async () => {
+                if(!this.timer) return;
+                await this.safePoll();
+                this.timer = setTimeout(tick, 2500);
+            };
+            this.timer = setTimeout(tick, 0);
+            this.watchdogTimer = setInterval(() => {
+                const staleMs = Date.now() - (this.lastPollAt || 0);
+                if(!this.lastPollAt || staleMs > 12000){
+                    this.safePoll();
+                }
+            }, 4000);
+        },
+        destroy(){
+            if(this.timer){ clearTimeout(this.timer); this.timer = null; }
+            if(this.watchdogTimer){ clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
+            this.polling = false;
+        },
+        async fetchTargets(){ try{ const r=await fetch('/api/drip/targets'); if(r.ok) this.savedTargets=await r.json(); }catch(e){} },
+        async refresh(){ this.jobs = await this.fetchJson(`/api/backup/jobs?_=${Date.now()}`); this.recomputeKpi(); if(this.selectedJob){ const latest = this.jobs.find(x=>x.id===this.selectedJob.id); if(latest) this.selectedJob = latest; } },
+        async pollRuntime(){ this.runtime = await this.fetchJson(`/api/backup/runtime?_=${Date.now()}`); },
+        async pollQueue(){ this.queue = await this.fetchJson(`/api/backup/queue?_=${Date.now()}`); this.recomputeKpi(); },
+        recomputeKpi(){ let running=0, uploaded=0, err=0, done=0; for(const j of this.jobs){ const s=(j.status||'').toLowerCase(); if(s.includes('đang chạy')) running+=1; if(s.includes('hoàn thành')||s.includes('không còn media')) done+=1; uploaded+=Number(j.uploaded_count||0); err+=Number(j.error_count||0);} const pending=Number(this.queue?.queued_count||0); let health='Stable'; if(err>0) health='Degraded'; if(this.jobs.some(j=>(j.last_error||'').length>0 && (j.status||'').toLowerCase().includes('lỗi'))) health='Blocked'; this.kpi={runningJobs:running,pendingItems:pending,totalUploaded:uploaded,health}; this.filterCount={all:this.jobs.length,running,error:this.jobs.filter(j=>Number(j.error_count||0)>0 || (j.status||'').toLowerCase().includes('lỗi')).length,done}; },
+        setFilter(v){ this.jobFilter=v; },
+        get filteredJobs(){ const q=(this.searchText||'').trim().toLowerCase(); return this.jobs.filter(j=>{ const s=(j.status||'').toLowerCase(); const name=(j.name||'').toLowerCase(); const okSearch=!q||name.includes(q)||String(j.id).includes(q)||String(j.last_processed_id||'').includes(q); if(!okSearch) return false; if(this.jobFilter==='running') return s.includes('đang chạy'); if(this.jobFilter==='error') return Number(j.error_count||0)>0 || s.includes('lỗi'); if(this.jobFilter==='done') return s.includes('hoàn thành')||s.includes('không còn media'); return true; }); },
+        get selectedRuntime(){
+            if(!this.selectedJob) return null;
+            const id = String(this.selectedJob.id);
+            return this.runtime?.[id] || this.runtime?.[Number(this.selectedJob.id)] || null;
+        },
+        get nowItems(){
+            const rows = this.queueItems?.items || [];
+            return rows.filter(it => it.state === 'in_progress').slice(0, 20);
+        },
+        get tabRows(){
+            const rows = this.queueItems?.items || [];
+            const phaseRank = (s) => {
+                const k = (s || '').toLowerCase();
+                if(k === 'download') return 0;
+                if(k === 'fetch') return 1;
+                if(k === 'prepare_video') return 2;
+                if(k === 'ready_upload') return 3;
+                if(k === 'upload') return 0;
+                if(k === 'verify') return 1;
+                return 9;
+            };
+            const bySeq = (a, b) => Number(a.seq || 0) - Number(b.seq || 0);
+            const byPhaseSeq = (a, b) => {
+                const d = phaseRank(a.sub_state) - phaseRank(b.sub_state);
+                if (d !== 0) return d;
+                return bySeq(a, b);
+            };
+            const downloading = rows
+                .filter(it => it.state === 'in_progress' && ['fetch','download','prepare_video','ready_upload'].includes((it.sub_state||'')))
+                .sort(byPhaseSeq);
+            const uploading = rows
+                .filter(it => it.state === 'in_progress' && ['upload','verify'].includes((it.sub_state||'')))
+                .sort(byPhaseSeq);
+            const queue = rows.filter(it => it.state === 'pending').sort(bySeq);
+            const done = rows.filter(it => it.state === 'done');
+            const errors = rows.filter(it => it.state === 'error');
+            return { downloading, uploading, queue, done, errors };
+        },
+        get activeRows(){
+            if(this.drawerTab === 'downloading') return this.tabRows.downloading;
+            if(this.drawerTab === 'uploading') return this.tabRows.uploading;
+            if(this.drawerTab === 'queue') return this.tabRows.queue.slice(0, 120);
+            return [];
+        },
+        get groupRows(){
+            const rows = this.queueItems?.items || [];
+            const m = {};
+            for(const it of rows){
+                const gid = Number(it.grouped_id || 0);
+                if(!gid) continue;
+                if(!m[gid]) m[gid] = { grouped_id: gid, total: 0, done: 0 };
+                m[gid].total += 1;
+                if(it.state === 'done') m[gid].done += 1;
+            }
+            return Object.values(m).sort((a,b)=>a.grouped_id-b.grouped_id).slice(0, 40);
+        },
+        get historyRows(){
+            const rows = this.queueItems?.items || [];
+            return {
+                done: rows.filter(it => it.state === 'done').slice(0, 30),
+                error: rows.filter(it => it.state === 'error').slice(0, 30),
+            };
+        },
+        get pendingCount(){
+            const rows = this.queueItems?.items || [];
+            return rows.filter(it => it.state === 'pending').length;
+        },
+        openDrawer(j){ this.drawerOpen=true; this.drawerTab='downloading'; this.selectedJob=j; this.settingsForm={ batch_limit:j.batch_limit, delay_min:j.delay_min, delay_max:j.delay_max, stop_on_error:!!j.stop_on_error, fast_download:!!j.fast_download, upload_retry_max:j.upload_retry_max, download_workers:j.download_workers||4, upload_workers:j.upload_workers||1 }; this.loadLogs(j.id); this.loadTelemetry(j.id); this.loadDiagnostics(j.id); this.loadMetrics(j.id); this.loadQueueItems(j.id); },
+        jobProgress(j){ const r=this.runtime?.[j.id]||{}; const scanned=Number(j.scanned_total||0); const processed=Number(j.processed_count||0); if(!Number(j.scan_complete||0)){ return Math.max(0,Math.min(99,Number(r.scan_pct||0))); } if(scanned<=0) return 0; const base=Math.round((processed/scanned)*100); const fine=Math.round(((Number(r.download_pct||0)+Number(r.upload_pct||0))/2)*0.2); return Math.max(0,Math.min(100,base+fine)); },
+        async addJob(){ if(!this.form.name||!this.form.start_link||!this.form.target_link) return alert('Nhập tên, link bắt đầu và đích.'); const r=await fetch('/api/backup/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.form)}); const d=await r.json(); if(d.error) alert(d.error); else { this.form.name=''; this.refresh(); } },
+        async preview(id){ const r=await fetch(`/api/backup/preview/${id}`); this.previewData=await r.json(); if(this.previewData.error) alert(this.previewData.error); },
+        async loadTelemetry(id){ this.telemetry = await this.fetchJson(`/api/backup/telemetry/${id}?limit=50&_=${Date.now()}`); this.telemetryJobId=id; },
+        async loadLogs(id){ this.logs = await this.fetchJson(`/api/backup/logs/${id}?limit=150&_=${Date.now()}`); this.logsJobId=id; },
+        async loadDiagnostics(id){ this.diagnostics = await this.fetchJson(`/api/backup/diagnostics/${id}?_=${Date.now()}`); },
+        async loadMetrics(id){ this.metrics = await this.fetchJson(`/api/backup/metrics/${id}?_=${Date.now()}`); },
+        async loadQueueItems(id){ this.queueItems = await this.fetchJson(`/api/backup/queue_items/${id}?limit=300&_=${Date.now()}`); },
+        async saveSettings(){ if(!this.selectedJob) return; const r=await fetch(`/api/backup/update/${this.selectedJob.id}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.settingsForm)}); const d=await r.json(); if(d.error) alert(d.error); else { await this.refresh(); alert('Đã lưu settings job'); } },
+        async run(id){ const r=await fetch(`/api/backup/run/${id}`,{method:'POST'}); const d=await r.json(); if(d.error) alert(d.error); await this.refresh(); },
+        async resume(id){ const r=await fetch(`/api/backup/resume/${id}`,{method:'POST'}); const d=await r.json(); if(d.error) alert(d.error); await this.refresh(); },
+        async pause(id){ await fetch(`/api/backup/pause/${id}`,{method:'POST'}); await this.refresh(); },
+        async reset(id){ if(!confirm('Reset tiến trình job này?')) return; await fetch(`/api/backup/reset/${id}`,{method:'POST'}); await this.refresh(); },
+        async remove(id){ if(!confirm('Xoá job backup này?')) return; await fetch(`/api/backup/delete/${id}`,{method:'DELETE'}); await this.refresh(); },
+        async cleanup(){ const r=await fetch('/api/backup/cleanup',{method:'POST'}); const d=await r.json(); alert(`Đã xoá ${d.removed || 0} file tạm.`); },
+        async startQueue(){
+            const ids = this.filteredJobs.map(j => Number(j.id)).filter(Boolean);
+            if(!ids.length) return alert('Không có job để chạy queue.');
+            const r=await fetch('/api/backup/queue/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids:ids})});
+            const d=await r.json();
+            if(d.error) alert(d.error);
+            await this.pollQueue();
+            await this.refresh();
+        },
+        async stopQueue(){ await fetch('/api/backup/queue/stop',{method:'POST'}); await this.pollQueue(); await this.refresh(); }
+    }))
+})
+</script>
