@@ -8,6 +8,7 @@ import re
 import shutil
 import time
 import traceback
+import urllib.request
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,8 @@ MODULE_INFO = {
 
 TMP_DIR = Path("downloads/backup_tmp")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOADS_DIR = Path("downloads")
+DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 FFMPEG_BIN = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
 
@@ -234,6 +237,48 @@ def cleanup_stale_tmp_files(max_age_sec: int = TMP_CLEANUP_MAX_AGE_SEC) -> tuple
     return removed, freed_bytes
 
 
+def cleanup_download_junk(max_age_sec: int = TMP_CLEANUP_MAX_AGE_SEC) -> tuple[int, int]:
+    removed = 0
+    freed_bytes = 0
+    now_ts = time.time()
+    junk_suffixes = (
+        ".part",
+        ".tmp",
+        ".temp",
+        ".crdownload",
+        ".download",
+        ".aria2",
+        ".log",
+    )
+    junk_names = ("ffmpeg2pass", "thumb", "remux", "safe", "low", "src")
+    if not DOWNLOADS_DIR.exists():
+        return 0, 0
+    for p in DOWNLOADS_DIR.rglob("*"):
+        try:
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(DOWNLOADS_DIR))
+            if rel.startswith("backup_tmp/"):
+                continue
+            name = p.name.lower()
+            if max_age_sec > 0 and (now_ts - p.stat().st_mtime) < max_age_sec:
+                continue
+            if (name.endswith(junk_suffixes) or any(k in name for k in junk_names) or p.stat().st_size == 0):
+                freed_bytes += int(p.stat().st_size or 0)
+                p.unlink()
+                removed += 1
+        except Exception:
+            continue
+    # Remove empty folders except backup_tmp
+    for d in sorted(DOWNLOADS_DIR.rglob("*"), reverse=True):
+        try:
+            if d.is_dir() and d != TMP_DIR and not any(d.iterdir()):
+                d.rmdir()
+        except Exception:
+            continue
+    return removed, freed_bytes
+
+
 def tmp_dir_free_bytes() -> int:
     return int(shutil.disk_usage(TMP_DIR).free)
 
@@ -245,6 +290,65 @@ def estimate_tmp_need_bytes(msg, kind: str) -> int:
         # Unknown size: reserve a conservative 256MB to reduce ENOSPC risk.
         return 256 * 1024 * 1024
     return int(src_size * ratio)
+
+
+def probe_network_mbps() -> float:
+    test_urls = [
+        "https://speed.cloudflare.com/__down?bytes=1048576",
+        "https://speed.hetzner.de/1MB.bin",
+    ]
+    for u in test_urls:
+        try:
+            start = time.time()
+            with urllib.request.urlopen(u, timeout=6) as resp:
+                payload = resp.read(512 * 1024)
+            elapsed = max(time.time() - start, 0.001)
+            if not payload:
+                continue
+            mbps = (len(payload) / elapsed) / (1024 * 1024)
+            if mbps > 0:
+                return round(mbps, 2)
+        except Exception:
+            continue
+    return 0.0
+
+
+def auto_tune_workers(job: dict[str, Any]) -> tuple[int, int, dict[str, float | int]]:
+    configured_dl = clamp(job.get("download_workers"), 4, 1, 8)
+    configured_ul = clamp(job.get("upload_workers"), 1, 1, 2)
+    free_mb = round(tmp_dir_free_bytes() / (1024 * 1024), 1)
+    net_mbps = probe_network_mbps()
+
+    if free_mb < 4096:
+        disk_dl_cap, disk_ul_cap = 1, 1
+    elif free_mb < 8192:
+        disk_dl_cap, disk_ul_cap = 2, 1
+    elif free_mb < 16384:
+        disk_dl_cap, disk_ul_cap = 3, 1
+    else:
+        disk_dl_cap, disk_ul_cap = 4, 2
+
+    if net_mbps <= 0:
+        net_dl_cap, net_ul_cap = 2, 1
+    elif net_mbps < 8:
+        net_dl_cap, net_ul_cap = 1, 1
+    elif net_mbps < 20:
+        net_dl_cap, net_ul_cap = 2, 1
+    elif net_mbps < 40:
+        net_dl_cap, net_ul_cap = 3, 1
+    else:
+        net_dl_cap, net_ul_cap = 4, 2
+
+    dl_workers = max(1, min(configured_dl, disk_dl_cap, net_dl_cap))
+    ul_workers = max(1, min(configured_ul, disk_ul_cap, net_ul_cap))
+    return dl_workers, ul_workers, {
+        "free_mb": free_mb,
+        "net_mbps": net_mbps,
+        "configured_dl": configured_dl,
+        "configured_ul": configured_ul,
+        "effective_dl": dl_workers,
+        "effective_ul": ul_workers,
+    }
 
 
 async def ensure_disk_budget(job_id: int, msg_id: int, required_bytes: int):
@@ -1132,8 +1236,16 @@ async def run_backup(job_id: int):
             record_job_log(job_id, "info", "scan", f"Dùng queue đã scan sẵn total={int(job.get('scanned_total') or 0)}")
 
         queue_recover_in_progress(job_id)
-        dl_workers = clamp(job.get("download_workers"), 1, 1, 8)
-        up_workers = clamp(job.get("upload_workers"), 1, 1, 2)
+        dl_workers, up_workers, auto_meta = auto_tune_workers(job)
+        record_job_log(
+            job_id,
+            "info",
+            "workers",
+            "Auto workers "
+            f"free_mb={auto_meta['free_mb']} net_mbps={auto_meta['net_mbps']} "
+            f"cfg_dl={auto_meta['configured_dl']} cfg_ul={auto_meta['configured_ul']} "
+            f"effective_dl={dl_workers} effective_ul={up_workers}",
+        )
         download_sem = asyncio.Semaphore(dl_workers)
         upload_sem = asyncio.Semaphore(up_workers)
         state_lock = asyncio.Lock()
@@ -1911,6 +2023,19 @@ async def cleanup_tmp():
             except Exception:
                 pass
     return {"ok": True, "removed": removed, "freed_mb": round(freed_bytes / (1024 * 1024), 2)}
+
+
+@router.post("/cleanup/downloads")
+async def cleanup_downloads():
+    tmp_removed, tmp_freed = cleanup_stale_tmp_files(max_age_sec=0)
+    junk_removed, junk_freed = cleanup_download_junk()
+    return {
+        "ok": True,
+        "removed": int(tmp_removed + junk_removed),
+        "removed_tmp": int(tmp_removed),
+        "removed_junk": int(junk_removed),
+        "freed_mb": round((tmp_freed + junk_freed) / (1024 * 1024), 2),
+    }
 
 
 @router.get("/telemetry/{job_id}")

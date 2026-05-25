@@ -83,6 +83,7 @@
       <div class="panel-foot">
         <button @click="addJob" class="tv-btn tv-btn-success">Tạo job</button>
         <button @click="cleanup" class="tv-btn tv-btn-secondary">Dọn temp</button>
+        <button @click="cleanupDownloads" class="tv-btn tv-btn-secondary">Dọn rác downloads</button>
       </div>
     </aside>
 
@@ -489,6 +490,11 @@ document.addEventListener('alpine:init', () => {
         async reset(id){ if(!confirm('Reset tiến trình job này?')) return; await fetch(`/api/backup/reset/${id}`,{method:'POST'}); await this.refresh(); },
         async remove(id){ if(!confirm('Xoá job backup này?')) return; await fetch(`/api/backup/delete/${id}`,{method:'DELETE'}); await this.refresh(); },
         async cleanup(){ const r=await fetch('/api/backup/cleanup',{method:'POST'}); const d=await r.json(); alert(`Đã xoá ${d.removed || 0} file tạm.`); },
+        async cleanupDownloads(){
+            const r = await fetch('/api/backup/cleanup/downloads',{method:'POST'});
+            const d = await r.json();
+            alert(`Dọn rác xong: tổng ${d.removed || 0} file (tmp ${d.removed_tmp || 0}, rác ${d.removed_junk || 0}), giải phóng ${d.freed_mb || 0} MB`);
+        },
         async startQueue(){
             const ids = this.filteredJobs.map(j => Number(j.id)).filter(Boolean);
             if(!ids.length) return alert('Không có job để chạy queue.');
