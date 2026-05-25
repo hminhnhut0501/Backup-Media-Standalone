@@ -1838,6 +1838,9 @@ async def run_job_queue():
                 await asyncio.sleep(0.5)
                 if not backup_queue:
                     break
+            while is_any_job_running() and not backup_queue_stop:
+                update_runtime(0, state="Queue chờ job thủ công kết thúc", action="queue_wait_manual")
+                await asyncio.sleep(2)
             job_id = backup_queue.pop(0)
             job = fetch_job(job_id)
             if not job:
@@ -2100,8 +2103,6 @@ async def start_queue(req: QueueReq, bg: BackgroundTasks):
     if backup_queue_running:
         added = enqueue_job_ids(req.job_ids or [])
         return {"ok": True, "running": True, "added_count": len(added), "queued_count": len(backup_queue)}
-    if is_any_job_running():
-        return {"error": "Đang có job chạy thủ công, hãy pause trước"}
 
     backup_queue.clear()
     added = enqueue_job_ids(req.job_ids or [])
@@ -2110,7 +2111,13 @@ async def start_queue(req: QueueReq, bg: BackgroundTasks):
 
     backup_queue_stop = False
     bg.add_task(run_job_queue)
-    return {"ok": True, "running": False, "added_count": len(added), "queued_count": len(backup_queue)}
+    return {
+        "ok": True,
+        "running": False,
+        "waiting_manual": is_any_job_running(),
+        "added_count": len(added),
+        "queued_count": len(backup_queue),
+    }
 
 
 @router.post("/queue/stop")

@@ -519,6 +519,7 @@ document.addEventListener('alpine:init', () => {
             const d=await r.json();
             if(d.error) alert(d.error);
             else if(d.running) alert(`Queue đang chạy. Đã thêm ${d.added_count || 0} job mới vào cuối hàng đợi.`);
+            else if(d.waiting_manual) alert(`Đã xếp ${d.added_count || 0} job vào hàng đợi. Queue sẽ chạy sau khi job thủ công hiện tại kết thúc.`);
             await this.pollQueue();
             await this.refresh();
         },
