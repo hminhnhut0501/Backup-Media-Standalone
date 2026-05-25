@@ -39,10 +39,16 @@ FFPROBE_BIN = shutil.which("ffprobe") or "ffprobe"
 MAX_LAST_ERROR = 240
 FLOOD_BUFFER_SECONDS = 2
 DEFAULT_UPLOAD_RETRIES = 3
-DEFAULT_FETCH_TIMEOUT = 30
-DEFAULT_DOWNLOAD_TIMEOUT = 900
-DEFAULT_UPLOAD_TIMEOUT = 900
+DEFAULT_FETCH_TIMEOUT = int(os.getenv("BACKUP_FETCH_TIMEOUT", "60"))
+DEFAULT_DOWNLOAD_TIMEOUT = int(os.getenv("BACKUP_DOWNLOAD_TIMEOUT", "3600"))
+DEFAULT_UPLOAD_TIMEOUT = int(os.getenv("BACKUP_UPLOAD_TIMEOUT", "3600"))
 FAST_ITER_REQUEST_MB = 2
+TMP_CLEANUP_MAX_AGE_SEC = int(os.getenv("BACKUP_TMP_MAX_AGE_SEC", "21600"))
+DISK_MIN_FREE_MB = int(os.getenv("BACKUP_DISK_MIN_FREE_MB", "4096"))
+DISK_WAIT_TIMEOUT_SEC = int(os.getenv("BACKUP_DISK_WAIT_TIMEOUT_SEC", "600"))
+DISK_WAIT_INTERVAL_SEC = int(os.getenv("BACKUP_DISK_WAIT_INTERVAL_SEC", "5"))
+VIDEO_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_VIDEO_TMP_OVERHEAD_RATIO", "2.4"))
+GENERIC_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_GENERIC_TMP_OVERHEAD_RATIO", "1.2"))
 
 backup_flags: dict[int, bool] = {}
 backup_runtime: dict[int, dict[str, Any]] = {}
@@ -66,7 +72,7 @@ class BackupReq(BaseModel):
     stop_on_error: bool = False
     fast_download: bool = True
     upload_retry_max: int = DEFAULT_UPLOAD_RETRIES
-    download_workers: int = 4
+    download_workers: int = 1
     upload_workers: int = 1
 
 
@@ -202,6 +208,77 @@ def clamp(value, default, min_value, max_value):
 
 def normalize_short_error(err: Exception | str) -> str:
     return str(err).replace("\n", " ").strip()[:MAX_LAST_ERROR]
+
+
+def cleanup_stale_tmp_files(max_age_sec: int = TMP_CLEANUP_MAX_AGE_SEC) -> tuple[int, int]:
+    removed = 0
+    freed_bytes = 0
+    now_ts = time.time()
+    try:
+        names = os.listdir(TMP_DIR)
+    except Exception:
+        return 0, 0
+    for name in names:
+        p = TMP_DIR / name
+        try:
+            if not p.is_file():
+                continue
+            st = p.stat()
+            if max_age_sec > 0 and (now_ts - st.st_mtime) < max_age_sec:
+                continue
+            freed_bytes += int(st.st_size or 0)
+            p.unlink()
+            removed += 1
+        except Exception:
+            continue
+    return removed, freed_bytes
+
+
+def tmp_dir_free_bytes() -> int:
+    return int(shutil.disk_usage(TMP_DIR).free)
+
+
+def estimate_tmp_need_bytes(msg, kind: str) -> int:
+    src_size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    ratio = VIDEO_TMP_OVERHEAD_RATIO if kind == "video" else GENERIC_TMP_OVERHEAD_RATIO
+    if src_size <= 0:
+        # Unknown size: reserve a conservative 256MB to reduce ENOSPC risk.
+        return 256 * 1024 * 1024
+    return int(src_size * ratio)
+
+
+async def ensure_disk_budget(job_id: int, msg_id: int, required_bytes: int):
+    reserve_bytes = max(0, DISK_MIN_FREE_MB) * 1024 * 1024
+    deadline = time.time() + max(5, DISK_WAIT_TIMEOUT_SEC)
+    cleaned_once = False
+    while True:
+        free_now = tmp_dir_free_bytes()
+        need_total = max(0, int(required_bytes)) + reserve_bytes
+        if free_now >= need_total:
+            return
+        if not cleaned_once:
+            cleanup_stale_tmp_files()
+            cleaned_once = True
+            free_now = tmp_dir_free_bytes()
+            if free_now >= need_total:
+                return
+        if time.time() >= deadline:
+            need_mb = round(need_total / (1024 * 1024), 1)
+            free_mb = round(free_now / (1024 * 1024), 1)
+            update_runtime(
+                job_id,
+                action="disk_wait_timeout",
+                state=f"Thiếu dung lượng: cần~{need_mb}MB, còn~{free_mb}MB",
+                current_message_id=msg_id,
+            )
+            raise RuntimeError(f"disk_space_wait_timeout:need_mb={need_mb}:free_mb={free_mb}")
+        update_runtime(
+            job_id,
+            action="disk_wait",
+            state=f"Chờ dung lượng trống cho #{msg_id}",
+            current_message_id=msg_id,
+        )
+        await asyncio.sleep(max(1, DISK_WAIT_INTERVAL_SEC))
 
 
 def update_job(job_id: int, **fields):
@@ -945,7 +1022,7 @@ def classify_error(err: Exception) -> tuple[str, str]:
         return "pipeline", text
     if "flood" in lower or "rpc" in lower or "telegram" in lower or "upload_retry_exhausted" in lower:
         return "telegram", text
-    if "download" in lower or "network" in lower or "timed out" in lower:
+    if "download" in lower or "network" in lower or "timed out" in lower or "timeout" in lower:
         return "source", text
     return "unknown", text
 
@@ -1013,6 +1090,16 @@ async def run_backup(job_id: int):
     }
     update_job(job_id, status="Đang chạy", last_error="")
     record_job_log(job_id, "info", "run", "Job bắt đầu chạy")
+    stale_removed, stale_freed = cleanup_stale_tmp_files()
+    free_mb_start = round(tmp_dir_free_bytes() / (1024 * 1024), 1)
+    if stale_removed > 0:
+        record_job_log(
+            job_id,
+            "info",
+            "cleanup",
+            f"Tự dọn tmp trước khi chạy: removed={stale_removed} freed_mb={round(stale_freed/(1024*1024),2)}",
+        )
+    record_job_log(job_id, "info", "disk", f"Dung lượng trống lúc start: free_mb={free_mb_start}")
 
     try:
         job = fetch_job(job_id)
@@ -1045,7 +1132,7 @@ async def run_backup(job_id: int):
             record_job_log(job_id, "info", "scan", f"Dùng queue đã scan sẵn total={int(job.get('scanned_total') or 0)}")
 
         queue_recover_in_progress(job_id)
-        dl_workers = clamp(job.get("download_workers"), 4, 1, 8)
+        dl_workers = clamp(job.get("download_workers"), 1, 1, 8)
         up_workers = clamp(job.get("upload_workers"), 1, 1, 2)
         download_sem = asyncio.Semaphore(dl_workers)
         upload_sem = asyncio.Semaphore(up_workers)
@@ -1115,6 +1202,7 @@ async def run_backup(job_id: int):
                     runtime_track_item(job_id, msg_id, "download", True)
                     queue_sub_progress(job_id, msg_id, "download", 8)
                     update_runtime(job_id, state=f"Đang tải #{msg_id}", current_message_id=msg_id, action="download")
+                    await ensure_disk_budget(job_id, msg_id, estimate_tmp_need_bytes(msg, kind))
                     ext = (getattr(getattr(msg, "file", None), "ext", None) or "bin").lstrip(".")
                     downloaded = path_for(job_id, msg_id, f"src.{ext}")
                     tmp_files.append(downloaded)
@@ -1193,6 +1281,8 @@ async def run_backup(job_id: int):
                 raise
             except Exception as e:
                 error_class, reason = classify_error(e)
+                tb_line = normalize_short_error(traceback.format_exc().splitlines()[-1] if traceback.format_exc() else "")
+                detail = f"{error_class}: {reason} | {tb_line}" if tb_line else f"{error_class}: {reason}"
                 async with state_lock:
                     processed_count += 1
                     error_count += 1
@@ -1203,7 +1293,7 @@ async def run_backup(job_id: int):
                     probe_input=probe_input, retries=retries_log, verify=verify_data, result="failed",
                     error_class=error_class, error_reason=reason
                 )
-                record_job_log(job_id, "error", "item", f"{error_class}: {reason}", msg_id)
+                record_job_log(job_id, "error", "item", detail, msg_id)
                 if bool(job.get("stop_on_error")):
                     stop_event.set()
             finally:
@@ -1276,6 +1366,7 @@ async def run_backup(job_id: int):
                     any_video = any_video or kind == "video"
                     runtime_track_item(job_id, mid, "download", True)
                     queue_sub_progress(job_id, mid, "download", 8)
+                    await ensure_disk_budget(job_id, mid, estimate_tmp_need_bytes(m, kind))
                     ext = (getattr(getattr(m, "file", None), "ext", None) or "bin").lstrip(".")
                     src_path = path_for(job_id, mid, f"src.{ext}")
                     tmp_files.append(src_path)
@@ -1403,6 +1494,14 @@ async def run_backup(job_id: int):
         record_job_log(job_id, "error", "runtime", normalize_short_error(e))
     finally:
         backup_flags[job_id] = False
+        stale_removed, stale_freed = cleanup_stale_tmp_files()
+        if stale_removed > 0:
+            record_job_log(
+                job_id,
+                "info",
+                "cleanup",
+                f"Tự dọn tmp sau khi chạy: removed={stale_removed} freed_mb={round(stale_freed/(1024*1024),2)}",
+            )
         record_job_log(job_id, "info", "run", "Job kết thúc")
 
 
@@ -1801,15 +1900,17 @@ async def delete_job(job_id: int):
 @router.post("/cleanup")
 async def cleanup_tmp():
     removed = 0
+    freed_bytes = 0
     for name in os.listdir(TMP_DIR):
         p = TMP_DIR / name
         if p.is_file():
             try:
+                freed_bytes += int(p.stat().st_size or 0)
                 p.unlink()
                 removed += 1
             except Exception:
                 pass
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "freed_mb": round(freed_bytes / (1024 * 1024), 2)}
 
 
 @router.get("/telemetry/{job_id}")
