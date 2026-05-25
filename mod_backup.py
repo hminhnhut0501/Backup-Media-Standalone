@@ -654,13 +654,14 @@ def infer_dimensions(stream):
 def video_plan():
     return [
         VideoPlanAttempt(name="tier_1_remux", out_suffix="remux.mp4", mode="remux"),
+        VideoPlanAttempt(name="tier_1b_remux_plain", out_suffix="remux_plain.mp4", mode="remux_plain"),
         VideoPlanAttempt(name="tier_2_transcode_safe", out_suffix="safe.mp4", mode="transcode"),
         VideoPlanAttempt(name="tier_3_transcode_low", out_suffix="low.mp4", mode="transcode_low"),
     ]
 
 
-async def remux_clean(src: str, dst: str):
-    await run_media_tool(
+async def remux_clean(src: str, dst: str, faststart: bool = True):
+    args = [
         FFMPEG_BIN,
         "-y",
         "-hide_banner",
@@ -676,13 +677,16 @@ async def remux_clean(src: str, dst: str):
         "0:a?",
         "-c",
         "copy",
-        "-movflags",
-        "+faststart",
         "-avoid_negative_ts",
         "make_zero",
         "-map_metadata",
         "-1",
         dst,
+    ]
+    if faststart:
+        args[-1:-1] = ["-movflags", "+faststart"]
+    await run_media_tool(
+        *args,
         timeout=1800,
     )
 
@@ -813,7 +817,9 @@ async def prepare_video(src_path: str, job_id: int, msg_id: int):
         thumb_path = path_for(job_id, msg_id, "thumb.jpg")
         try:
             if plan.mode == "remux":
-                await remux_clean(src_path, out_path)
+                await remux_clean(src_path, out_path, faststart=True)
+            elif plan.mode == "remux_plain":
+                await remux_clean(src_path, out_path, faststart=False)
             elif plan.mode == "transcode":
                 await transcode_safe(src_path, out_path, low=False)
             else:
