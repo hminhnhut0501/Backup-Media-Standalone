@@ -50,8 +50,9 @@ TMP_CLEANUP_MAX_AGE_SEC = int(os.getenv("BACKUP_TMP_MAX_AGE_SEC", "21600"))
 DISK_MIN_FREE_MB = int(os.getenv("BACKUP_DISK_MIN_FREE_MB", "4096"))
 DISK_WAIT_TIMEOUT_SEC = int(os.getenv("BACKUP_DISK_WAIT_TIMEOUT_SEC", "600"))
 DISK_WAIT_INTERVAL_SEC = int(os.getenv("BACKUP_DISK_WAIT_INTERVAL_SEC", "5"))
-VIDEO_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_VIDEO_TMP_OVERHEAD_RATIO", "2.4"))
-GENERIC_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_GENERIC_TMP_OVERHEAD_RATIO", "1.2"))
+VIDEO_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_VIDEO_TMP_OVERHEAD_RATIO", "1.7"))
+GENERIC_TMP_OVERHEAD_RATIO = float(os.getenv("BACKUP_GENERIC_TMP_OVERHEAD_RATIO", "1.15"))
+DISK_ABS_MIN_FREE_MB = int(os.getenv("BACKUP_DISK_ABS_MIN_FREE_MB", "768"))
 
 backup_flags: dict[int, bool] = {}
 backup_runtime: dict[int, dict[str, Any]] = {}
@@ -289,7 +290,12 @@ def estimate_tmp_need_bytes(msg, kind: str) -> int:
     if src_size <= 0:
         # Unknown size: reserve a conservative 256MB to reduce ENOSPC risk.
         return 256 * 1024 * 1024
-    return int(src_size * ratio)
+    # Cap oversized estimation on free-tier disks while keeping safety margin.
+    est = int(src_size * ratio)
+    if kind == "video":
+        extra_cap = min(2 * 1024 * 1024 * 1024, int(src_size * 0.8))
+        est = max(src_size + 256 * 1024 * 1024, src_size + extra_cap)
+    return est
 
 
 def probe_network_mbps() -> float:
@@ -352,16 +358,32 @@ def auto_tune_workers(job: dict[str, Any]) -> tuple[int, int, dict[str, float | 
 
 
 async def ensure_disk_budget(job_id: int, msg_id: int, required_bytes: int):
-    reserve_bytes = max(0, DISK_MIN_FREE_MB) * 1024 * 1024
+    usage = shutil.disk_usage(TMP_DIR)
+    total_bytes = int(usage.total)
+    configured_reserve = max(0, DISK_MIN_FREE_MB) * 1024 * 1024
+    hard_min_reserve = max(256, DISK_ABS_MIN_FREE_MB) * 1024 * 1024
+    # Adaptive reserve: avoid over-conservative 4GB on small free-tier disks.
+    adaptive_cap = int(total_bytes * 0.12)  # keep up to 12% of disk free
+    reserve_bytes = max(hard_min_reserve, min(configured_reserve, adaptive_cap))
+    if reserve_bytes > configured_reserve:
+        reserve_bytes = configured_reserve
+
+    need_data = max(0, int(required_bytes))
+    need_total = need_data + reserve_bytes
+    # If computed budget is impossible on this disk, fallback to hard-min reserve.
+    if need_total > int(total_bytes * 0.95):
+        reserve_bytes = hard_min_reserve
+        need_total = need_data + reserve_bytes
+
     deadline = time.time() + max(5, DISK_WAIT_TIMEOUT_SEC)
     cleaned_once = False
     while True:
         free_now = tmp_dir_free_bytes()
-        need_total = max(0, int(required_bytes)) + reserve_bytes
         if free_now >= need_total:
             return
         if not cleaned_once:
             cleanup_stale_tmp_files()
+            cleanup_download_junk()
             cleaned_once = True
             free_now = tmp_dir_free_bytes()
             if free_now >= need_total:
@@ -369,13 +391,14 @@ async def ensure_disk_budget(job_id: int, msg_id: int, required_bytes: int):
         if time.time() >= deadline:
             need_mb = round(need_total / (1024 * 1024), 1)
             free_mb = round(free_now / (1024 * 1024), 1)
+            reserve_mb = round(reserve_bytes / (1024 * 1024), 1)
             update_runtime(
                 job_id,
                 action="disk_wait_timeout",
-                state=f"Thiếu dung lượng: cần~{need_mb}MB, còn~{free_mb}MB",
+                state=f"Thiếu dung lượng: cần~{need_mb}MB (reserve {reserve_mb}), còn~{free_mb}MB",
                 current_message_id=msg_id,
             )
-            raise RuntimeError(f"disk_space_wait_timeout:need_mb={need_mb}:free_mb={free_mb}")
+            raise RuntimeError(f"disk_space_wait_timeout:need_mb={need_mb}:free_mb={free_mb}:reserve_mb={reserve_mb}")
         update_runtime(
             job_id,
             action="disk_wait",
