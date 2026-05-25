@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from collections import namedtuple
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -135,6 +136,61 @@ class FreeTierSimulationTests(unittest.TestCase):
         self.assertEqual(ul, 1)
         self.assertEqual(meta["effective_dl"], 2)
         self.assertEqual(meta["effective_ul"], 1)
+
+    def test_download_empty_fast_path_falls_back_to_standard_download(self):
+        dst = str(Path(self.tmp.name) / "media.bin")
+        payload = b"x" * 1024
+        msg = SimpleNamespace(id=6286, media=object(), file=SimpleNamespace(size=len(payload)))
+
+        class FakeClient:
+            async def iter_download(self, media, request_size):
+                if False:
+                    yield b""
+
+            async def download_media(self, media, file, progress_callback):
+                with open(file, "wb") as fh:
+                    fh.write(payload)
+                await progress_callback(len(payload), len(payload))
+                return file
+
+        async def run_case():
+            self.mod.backup_flags[self.job_id] = True
+            self.mod.backup_runtime[self.job_id] = {}
+            return await self.mod.download_media_with_fallback(self.job_id, FakeClient(), msg, dst, True)
+
+        result = asyncio.run(run_case())
+        self.assertEqual(result, dst)
+        self.assertEqual(os.path.getsize(dst), len(payload))
+
+    def test_download_partial_standard_retry_then_success(self):
+        dst = str(Path(self.tmp.name) / "retry-media.bin")
+        payload = b"y" * 2048
+        msg = SimpleNamespace(id=6282, media=object(), file=SimpleNamespace(size=len(payload)))
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def download_media(self, media, file, progress_callback):
+                self.calls += 1
+                data = b"bad" if self.calls == 1 else payload
+                with open(file, "wb") as fh:
+                    fh.write(data)
+                await progress_callback(len(data), len(payload))
+                return file
+
+        client = FakeClient()
+
+        async def run_case():
+            self.mod.backup_flags[self.job_id] = True
+            self.mod.backup_runtime[self.job_id] = {}
+            with patch.object(self.mod, "DEFAULT_DOWNLOAD_RETRIES", 2):
+                return await self.mod.download_media_with_fallback(self.job_id, client, msg, dst, False)
+
+        result = asyncio.run(run_case())
+        self.assertEqual(result, dst)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(os.path.getsize(dst), len(payload))
 
 
 if __name__ == "__main__":

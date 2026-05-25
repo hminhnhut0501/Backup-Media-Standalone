@@ -44,6 +44,7 @@ FLOOD_BUFFER_SECONDS = 2
 DEFAULT_UPLOAD_RETRIES = 3
 DEFAULT_FETCH_TIMEOUT = int(os.getenv("BACKUP_FETCH_TIMEOUT", "60"))
 DEFAULT_DOWNLOAD_TIMEOUT = int(os.getenv("BACKUP_DOWNLOAD_TIMEOUT", "3600"))
+DEFAULT_DOWNLOAD_RETRIES = int(os.getenv("BACKUP_DOWNLOAD_RETRIES", "3"))
 DEFAULT_UPLOAD_TIMEOUT = int(os.getenv("BACKUP_UPLOAD_TIMEOUT", "3600"))
 FAST_ITER_REQUEST_MB = 2
 TMP_CLEANUP_MAX_AGE_SEC = int(os.getenv("BACKUP_TMP_MAX_AGE_SEC", "21600"))
@@ -944,12 +945,22 @@ async def upload_with_retry(job_id: int, client, target, send_params: dict, retr
     raise RuntimeError(f"upload_retry_exhausted:{normalize_short_error(last_exc)}")
 
 
+def validate_downloaded_file(path: str, expected_bytes: int = 0):
+    if not path or not os.path.exists(path):
+        raise RuntimeError("download_missing_file")
+    actual = int(os.path.getsize(path) or 0)
+    if actual <= 0:
+        raise RuntimeError("download_empty_file")
+    if expected_bytes > 0 and actual < int(expected_bytes * 0.98):
+        raise RuntimeError(f"download_size_mismatch:expected={expected_bytes}:actual={actual}")
+
+
 async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_download: bool):
     msg_id = int(getattr(msg, "id", 0) or 0)
-    start_ts = time.time()
     total_bytes = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    errors = []
 
-    async def progress(cur, total):
+    async def progress(cur, total, start_ts):
         if not backup_flags.get(job_id):
             raise asyncio.CancelledError("paused")
         pct = round((cur / total) * 100, 1) if total else 0
@@ -957,28 +968,66 @@ async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_
         if msg_id:
             runtime_update_speed(job_id, msg_id, "download", int(cur or 0), start_ts)
 
-    try:
-        if fast_download:
-            try:
-                async def iter_fast_download():
-                    downloaded = 0
-                    req_size = FAST_ITER_REQUEST_MB * 1024 * 1024
-                    with open(dst, "wb") as fh:
-                        async for chunk in client.iter_download(msg.media, request_size=req_size):
-                            if not backup_flags.get(job_id):
-                                raise asyncio.CancelledError("paused")
-                            fh.write(chunk)
-                            downloaded += len(chunk)
-                            await progress(downloaded, total_bytes)
-                    return dst
+    async def clear_partial():
+        try:
+            if dst and os.path.exists(dst):
+                os.remove(dst)
+        except Exception:
+            pass
 
-                return await asyncio.wait_for(iter_fast_download(), timeout=DEFAULT_DOWNLOAD_TIMEOUT)
-            except Exception:
-                pass
-        return await asyncio.wait_for(
-            client.download_media(msg.media, file=dst, progress_callback=progress),
-            timeout=DEFAULT_DOWNLOAD_TIMEOUT,
-        )
+    try:
+        for attempt in range(1, max(1, DEFAULT_DOWNLOAD_RETRIES) + 1):
+            methods = ["fast", "standard"] if fast_download else ["standard"]
+            for method in methods:
+                await clear_partial()
+                start_ts = time.time()
+                try:
+                    if method == "fast":
+                        async def iter_fast_download():
+                            downloaded = 0
+                            req_size = FAST_ITER_REQUEST_MB * 1024 * 1024
+                            with open(dst, "wb") as fh:
+                                async for chunk in client.iter_download(msg.media, request_size=req_size):
+                                    if not backup_flags.get(job_id):
+                                        raise asyncio.CancelledError("paused")
+                                    if not chunk:
+                                        continue
+                                    fh.write(chunk)
+                                    downloaded += len(chunk)
+                                    await progress(downloaded, total_bytes, start_ts)
+
+                        await asyncio.wait_for(iter_fast_download(), timeout=DEFAULT_DOWNLOAD_TIMEOUT)
+                        validate_downloaded_file(dst, total_bytes)
+                        return dst
+
+                    async def standard_progress(cur, total):
+                        await progress(cur, total, start_ts)
+
+                    result_path = await asyncio.wait_for(
+                        client.download_media(
+                            msg.media,
+                            file=dst,
+                            progress_callback=standard_progress,
+                        ),
+                        timeout=DEFAULT_DOWNLOAD_TIMEOUT,
+                    )
+                    final_path = result_path or dst
+                    validate_downloaded_file(final_path, total_bytes)
+                    if final_path != dst and os.path.exists(final_path):
+                        return str(final_path)
+                    return dst
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    errors.append(f"{method}#{attempt}:{normalize_short_error(e)}")
+                    record_job_log(job_id, "warn", "download", errors[-1], msg_id)
+                    await clear_partial()
+                    if method == "fast":
+                        continue
+                    if attempt < max(1, DEFAULT_DOWNLOAD_RETRIES):
+                        await sleep_with_pause_check(job_id, min(12, 2 ** (attempt - 1)))
+
+        raise RuntimeError(f"download_failed:{' | '.join(errors[-6:])}")
     finally:
         if msg_id:
             runtime_clear_speed(job_id, msg_id, "download")
