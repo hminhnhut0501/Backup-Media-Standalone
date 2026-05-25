@@ -154,6 +154,7 @@
         <button @click="drawerTab='uploading'" :class="drawerTab==='uploading' ? 'active' : ''">Đang upload (<span x-text="tabRows.uploading.length"></span>)</button>
         <button @click="drawerTab='queue'" :class="drawerTab==='queue' ? 'active' : ''">Hàng đợi (<span x-text="tabRows.queue.length"></span>)</button>
         <button @click="drawerTab='logs'" :class="drawerTab==='logs' ? 'active' : ''">Nhật ký</button>
+        <button @click="drawerTab='error_logs'" :class="drawerTab==='error_logs' ? 'active' : ''">Lỗi chi tiết (<span x-text="errorLogs.length"></span>)</button>
         <button @click="drawerTab='settings'" :class="drawerTab==='settings' ? 'active' : ''">Cài đặt</button>
       </div>
 
@@ -208,6 +209,27 @@
               <article class="log-item">
                 <p><span x-text="l.ts || '-'"></span> · <b x-text="l.level || 'info'"></b> · <b x-text="l.stage || '-'"></b></p>
                 <p x-text="l.message || '-'"></p>
+              </article>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="drawerTab==='error_logs'" style="display:none" class="panel-soft">
+          <div class="list-head">
+            <p>Lỗi chi tiết</p>
+            <button @click="selectedJob && Promise.all([loadLogs(selectedJob.id), loadTelemetry(selectedJob.id), loadQueueItems(selectedJob.id)])" class="tv-btn tv-btn-secondary">Làm mới</button>
+          </div>
+          <div class="queue-list">
+            <template x-if="errorLogs.length===0"><p class="empty">Chưa có lỗi chi tiết cho job này.</p></template>
+            <template x-for="(e, idx) in errorLogs" :key="`err-${idx}-${e.ts || ''}-${e.source_message_id || ''}`">
+              <article class="log-item">
+                <p>
+                  <span x-text="e.ts || '-'"></span>
+                  · <b x-text="e.stage || e.sub_state || '-'"></b>
+                  · msg <b x-text="e.source_message_id || '-'"></b>
+                  · retry <b x-text="`${e.upload_retries || 0}/${e.upload_retry_max || 0}`"></b>
+                </p>
+                <p><b x-text="e.error_class || 'runtime_error'"></b>: <span x-text="e.error_reason || e.message || 'unknown error'"></span></p>
               </article>
             </template>
           </div>
@@ -358,6 +380,75 @@ document.addEventListener('alpine:init', () => {
             if(this.drawerTab === 'uploading') return this.tabRows.uploading;
             if(this.drawerTab === 'queue') return this.tabRows.queue.slice(0, 120);
             return [];
+        },
+        get errorLogs(){
+            const out = [];
+            const seen = new Set();
+            const errWords = /(timeout|timed out|internal server error|runtime|error|failed|lỗi)/i;
+
+            for(const l of (this.logs || [])){
+                const msg = String(l.message || '');
+                const lvl = String(l.level || '').toLowerCase();
+                if(lvl === 'error' || errWords.test(msg)){
+                    const key = `l:${l.ts || ''}:${msg}`;
+                    if(seen.has(key)) continue;
+                    seen.add(key);
+                    out.push({
+                        ts: l.ts || '',
+                        stage: l.stage || '',
+                        source_message_id: l.source_message_id || '',
+                        upload_retries: l.upload_retries || 0,
+                        upload_retry_max: l.upload_retry_max || 0,
+                        error_class: l.error_class || 'log_error',
+                        error_reason: l.error_reason || msg,
+                        message: msg
+                    });
+                }
+            }
+
+            for(const t of (this.telemetry || [])){
+                const result = String(t.result || '').toLowerCase();
+                const errReason = String(t.error_reason || t.message || '');
+                if(result === 'failed' || errWords.test(errReason)){
+                    const key = `t:${t.ts || ''}:${t.source_message_id || ''}:${errReason}`;
+                    if(seen.has(key)) continue;
+                    seen.add(key);
+                    out.push({
+                        ts: t.ts || '',
+                        stage: t.phase || t.stage || '',
+                        sub_state: t.sub_state || '',
+                        source_message_id: t.source_message_id || '',
+                        upload_retries: t.upload_retries || 0,
+                        upload_retry_max: t.upload_retry_max || 0,
+                        error_class: t.error_class || 'telemetry_failed',
+                        error_reason: t.error_reason || errReason,
+                        message: t.message || ''
+                    });
+                }
+            }
+
+            for(const q of (this.queueItems?.items || [])){
+                if(q.state !== 'error') continue;
+                const reason = String(q.last_error || q.error_reason || 'queue error');
+                const key = `q:${q.seq || ''}:${q.source_message_id || ''}:${reason}`;
+                if(seen.has(key)) continue;
+                seen.add(key);
+                out.push({
+                    ts: q.updated_at || q.created_at || '',
+                    stage: q.state || '',
+                    sub_state: q.sub_state || '',
+                    source_message_id: q.source_message_id || '',
+                    upload_retries: q.upload_retries || 0,
+                    upload_retry_max: q.upload_retry_max || 0,
+                    error_class: q.error_class || 'queue_error',
+                    error_reason: reason,
+                    message: reason
+                });
+            }
+
+            return out
+                .sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')))
+                .slice(0, 300);
         },
         get groupRows(){
             const rows = this.queueItems?.items || [];
