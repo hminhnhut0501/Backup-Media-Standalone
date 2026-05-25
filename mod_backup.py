@@ -571,6 +571,17 @@ def path_for(job_id: int, msg_id: int, suffix: str):
     return str(TMP_DIR / f"backup_{job_id}_{msg_id}_{int(time.time()*1000)}_{suffix}")
 
 
+def remove_tmp_file(path: str) -> int:
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        size = int(os.path.getsize(path) or 0)
+        os.remove(path)
+        return size
+    except Exception:
+        return 0
+
+
 async def run_media_tool(*args, timeout=900):
     process = await asyncio.create_subprocess_exec(
         *args,
@@ -1484,6 +1495,11 @@ async def run_backup(job_id: int):
                             raise RuntimeError(f"video_plan_all_failed:{prepared.get('failures')}")
                         send_file_path = prepared["file"]
                         tmp_files.append(send_file_path)
+                        if send_file_path != downloaded:
+                            freed = remove_tmp_file(downloaded)
+                            if freed:
+                                tmp_files = [p for p in tmp_files if p != downloaded]
+                                record_job_log(job_id, "info", "cleanup", f"Xóa source sau ffmpeg freed_mb={round(freed/(1024*1024),2)}", msg_id)
                         if prepared.get("thumb"):
                             tmp_files.append(prepared["thumb"])
                         plan_used = prepared["plan"]
@@ -1646,6 +1662,11 @@ async def run_backup(job_id: int):
                             raise RuntimeError(f"video_plan_all_failed:{mid}")
                         send_file_path = prepared["file"]
                         tmp_files.append(send_file_path)
+                        if send_file_path != downloaded:
+                            freed = remove_tmp_file(downloaded)
+                            if freed:
+                                tmp_files = [p for p in tmp_files if p != downloaded]
+                                record_job_log(job_id, "info", "cleanup", f"Xóa source sau ffmpeg freed_mb={round(freed/(1024*1024),2)}", mid)
                         if prepared.get("thumb"):
                             tmp_files.append(prepared["thumb"])
                     queue_sub_progress(job_id, mid, "ready_upload", 64)
