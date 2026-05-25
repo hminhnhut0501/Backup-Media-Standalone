@@ -1808,13 +1808,36 @@ def is_any_job_running() -> bool:
     return any(bool(v) for v in backup_flags.values())
 
 
+def enqueue_job_ids(job_ids: list[int]) -> list[int]:
+    added = []
+    queued = {int(x) for x in backup_queue}
+    current = int(backup_queue_current or 0)
+    for x in job_ids or []:
+        try:
+            jid = int(x)
+        except Exception:
+            continue
+        if jid <= 0 or jid in queued or jid == current:
+            continue
+        if backup_flags.get(jid) or not fetch_job(jid):
+            continue
+        backup_queue.append(jid)
+        queued.add(jid)
+        added.append(jid)
+    return added
+
+
 async def run_job_queue():
     global backup_queue_running, backup_queue_stop, backup_queue_current
     backup_queue_running = True
     backup_queue_stop = False
     backup_queue_current = None
     try:
-        while backup_queue and not backup_queue_stop:
+        while not backup_queue_stop:
+            if not backup_queue:
+                await asyncio.sleep(0.5)
+                if not backup_queue:
+                    break
             job_id = backup_queue.pop(0)
             job = fetch_job(job_id)
             if not job:
@@ -1985,7 +2008,7 @@ async def add_job(req: BackupReq):
     last_processed_id = start_id - 1 if is_forward else start_id + 1
 
     with closing(get_db_connection()) as conn:
-        conn.execute(
+        cur = conn.execute(
             '''INSERT INTO backup_jobs (
                 name, source_chat, source_topic_id, target_link, target_topic_id,
                 start_id, end_id, last_processed_id, media_filter, caption_mode, caption,
@@ -2013,8 +2036,14 @@ async def add_job(req: BackupReq):
                 clamp(req.upload_workers, 1, 1, 2),
             ),
         )
+        job_id = int(cur.lastrowid)
         conn.commit()
-    return {"ok": True}
+    queued = False
+    if backup_queue_running and not backup_queue_stop:
+        queued = bool(enqueue_job_ids([job_id]))
+        if queued:
+            record_job_log(job_id, "info", "queue", "Job mới được thêm vào cuối hàng đợi đang chạy")
+    return {"ok": True, "job_id": job_id, "queued": queued}
 
 
 @router.get("/preview/{job_id}")
@@ -2069,30 +2098,19 @@ class JobSettingsReq(BaseModel):
 async def start_queue(req: QueueReq, bg: BackgroundTasks):
     global backup_queue_running, backup_queue_stop
     if backup_queue_running:
-        return {"error": "Queue đang chạy"}
+        added = enqueue_job_ids(req.job_ids or [])
+        return {"ok": True, "running": True, "added_count": len(added), "queued_count": len(backup_queue)}
     if is_any_job_running():
         return {"error": "Đang có job chạy thủ công, hãy pause trước"}
 
-    deduped = []
-    seen = set()
-    for x in req.job_ids or []:
-        try:
-            jid = int(x)
-        except Exception:
-            continue
-        if jid in seen:
-            continue
-        seen.add(jid)
-        if fetch_job(jid):
-            deduped.append(jid)
-    if not deduped:
+    backup_queue.clear()
+    added = enqueue_job_ids(req.job_ids or [])
+    if not added:
         return {"error": "Không có job hợp lệ để chạy queue"}
 
-    backup_queue.clear()
-    backup_queue.extend(deduped)
     backup_queue_stop = False
     bg.add_task(run_job_queue)
-    return {"ok": True, "queued_count": len(backup_queue)}
+    return {"ok": True, "running": False, "added_count": len(added), "queued_count": len(backup_queue)}
 
 
 @router.post("/queue/stop")

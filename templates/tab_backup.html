@@ -482,7 +482,7 @@ document.addEventListener('alpine:init', () => {
         },
         openDrawer(j){ this.drawerOpen=true; this.drawerTab='downloading'; this.selectedJob=j; this.settingsForm={ batch_limit:j.batch_limit, delay_min:j.delay_min, delay_max:j.delay_max, stop_on_error:!!j.stop_on_error, fast_download:!!j.fast_download, upload_retry_max:j.upload_retry_max, download_workers:j.download_workers||4, upload_workers:j.upload_workers||1 }; this.loadLogs(j.id); this.loadTelemetry(j.id); this.loadDiagnostics(j.id); this.loadMetrics(j.id); this.loadQueueItems(j.id); },
         jobProgress(j){ const r=this.runtime?.[j.id]||{}; const scanned=Number(j.scanned_total||0); const processed=Number(j.processed_count||0); if(!Number(j.scan_complete||0)){ return Math.max(0,Math.min(99,Number(r.scan_pct||0))); } if(scanned<=0) return 0; const base=Math.round((processed/scanned)*100); const fine=Math.round(((Number(r.download_pct||0)+Number(r.upload_pct||0))/2)*0.2); return Math.max(0,Math.min(100,base+fine)); },
-        async addJob(){ if(!this.form.name||!this.form.start_link||!this.form.target_link) return alert('Nhập tên, link bắt đầu và đích.'); const r=await fetch('/api/backup/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.form)}); const d=await r.json(); if(d.error) alert(d.error); else { this.form.name=''; this.refresh(); } },
+        async addJob(){ if(!this.form.name||!this.form.start_link||!this.form.target_link) return alert('Nhập tên, link bắt đầu và đích.'); const r=await fetch('/api/backup/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(this.form)}); const d=await r.json(); if(d.error) alert(d.error); else { this.form.name=''; if(d.queued) alert('Job mới đã được thêm vào cuối hàng đợi.'); await this.pollQueue(); await this.refresh(); } },
         async preview(id){ const r=await fetch(`/api/backup/preview/${id}`); this.previewData=await r.json(); if(this.previewData.error) alert(this.previewData.error); },
         async loadTelemetry(id){ this.telemetry = await this.fetchJson(`/api/backup/telemetry/${id}?limit=50&_=${Date.now()}`); this.telemetryJobId=id; },
         async loadLogs(id){ this.logs = await this.fetchJson(`/api/backup/logs/${id}?limit=150&_=${Date.now()}`); this.logsJobId=id; },
@@ -518,6 +518,7 @@ document.addEventListener('alpine:init', () => {
             const r=await fetch('/api/backup/queue/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({job_ids:ids})});
             const d=await r.json();
             if(d.error) alert(d.error);
+            else if(d.running) alert(`Queue đang chạy. Đã thêm ${d.added_count || 0} job mới vào cuối hàng đợi.`);
             await this.pollQueue();
             await this.refresh();
         },
