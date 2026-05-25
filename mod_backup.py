@@ -363,7 +363,7 @@ async def ensure_disk_budget(job_id: int, msg_id: int, required_bytes: int):
     configured_reserve = max(0, DISK_MIN_FREE_MB) * 1024 * 1024
     hard_min_reserve = max(256, DISK_ABS_MIN_FREE_MB) * 1024 * 1024
     # Adaptive reserve: avoid over-conservative 4GB on small free-tier disks.
-    adaptive_cap = int(total_bytes * 0.12)  # keep up to 12% of disk free
+    adaptive_cap = int(total_bytes * 0.06)  # keep a practical reserve on small free-tier disks
     reserve_bytes = max(hard_min_reserve, min(configured_reserve, adaptive_cap))
     if reserve_bytes > configured_reserve:
         reserve_bytes = configured_reserve
@@ -1047,12 +1047,23 @@ def queue_next_pending(job_id: int):
 
 def queue_mark(job_id: int, message_id: int, state: str, last_error: str = ""):
     with closing(get_db_connection()) as conn:
-        conn.execute(
-            """UPDATE backup_job_queue
-               SET state=?, last_error=?, updated_at=?
-               WHERE job_id=? AND source_message_id=?""",
-            (state, last_error[:MAX_LAST_ERROR], int(time.time()), job_id, message_id),
-        )
+        if state == "error":
+            conn.execute(
+                """UPDATE backup_job_queue
+                   SET state=?,
+                       last_error=?,
+                       attempt_count=attempt_count+1,
+                       updated_at=?
+                   WHERE job_id=? AND source_message_id=?""",
+                (state, last_error[:MAX_LAST_ERROR], int(time.time()), job_id, message_id),
+            )
+        else:
+            conn.execute(
+                """UPDATE backup_job_queue
+                   SET state=?, last_error=?, updated_at=?
+                   WHERE job_id=? AND source_message_id=?""",
+                (state, last_error[:MAX_LAST_ERROR], int(time.time()), job_id, message_id),
+            )
         conn.commit()
 
 
