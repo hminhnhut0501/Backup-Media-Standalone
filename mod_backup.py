@@ -1102,6 +1102,65 @@ def queue_recover_in_progress(job_id: int):
         conn.commit()
 
 
+def is_retryable_queue_error(last_error: str) -> bool:
+    text = (last_error or "").lower()
+    keys = (
+        "disk_space_wait_timeout",
+        "timeout",
+        "timed out",
+        "network",
+        "flood",
+        "rpc",
+        "connection",
+        "temporarily",
+        "429",
+    )
+    return any(k in text for k in keys)
+
+
+def queue_requeue_errors(job_id: int, retryable_only: bool = True, max_attempt_count: int = 3) -> int:
+    now_ts = int(time.time())
+    with closing(get_db_connection()) as conn:
+        rows = conn.execute(
+            "SELECT source_message_id, attempt_count, last_error FROM backup_job_queue WHERE job_id=? AND state='error'",
+            (job_id,),
+        ).fetchall()
+        selected = []
+        for row in rows:
+            msg_id = int(row[0])
+            attempts = int(row[1] or 0)
+            last_error = str(row[2] or "")
+            if attempts >= max_attempt_count:
+                continue
+            if retryable_only and not is_retryable_queue_error(last_error):
+                continue
+            selected.append(msg_id)
+        if selected:
+            conn.executemany(
+                """UPDATE backup_job_queue
+                   SET state='pending',
+                       sub_state='retry_pending',
+                       sub_progress=0,
+                       last_error='',
+                       updated_at=?
+                   WHERE job_id=? AND source_message_id=?""",
+                [(now_ts, job_id, mid) for mid in selected],
+            )
+            # These items were already counted as processed+error. Requeueing them
+            # should make the job counters represent the current queue state again.
+            conn.execute(
+                """UPDATE backup_jobs
+                   SET processed_count=MAX(0, processed_count-?),
+                       error_count=MAX(0, error_count-?),
+                       status='Sẵn sàng retry',
+                       last_error=''
+                   WHERE id=?""",
+                (len(selected), len(selected), job_id),
+            )
+            conn.commit()
+        return len(selected)
+
+
 async def scan_job_queue(job_id: int, job: dict[str, Any], client):
     queue_clear(job_id)
     update_job(job_id, scan_complete=0, scanned_total=0, status="Đang scan nguồn 🔎", last_error="")
@@ -1259,6 +1318,9 @@ async def run_backup(job_id: int):
             record_job_log(job_id, "info", "scan", f"Dùng queue đã scan sẵn total={int(job.get('scanned_total') or 0)}")
 
         queue_recover_in_progress(job_id)
+        auto_retried = queue_requeue_errors(job_id, retryable_only=True, max_attempt_count=3)
+        if auto_retried > 0:
+            record_job_log(job_id, "info", "retry", f"Auto retry queue_error -> pending: {auto_retried} item")
         dl_workers, up_workers, auto_meta = auto_tune_workers(job)
         record_job_log(
             job_id,
@@ -1961,6 +2023,19 @@ async def pause_job(job_id: int):
     backup_flags[job_id] = False
     update_job(job_id, status="Đã tạm dừng")
     return {"ok": True}
+
+
+@router.post("/retry_errors/{job_id}")
+async def retry_errors(job_id: int, retryable_only: bool = True):
+    job = fetch_job(job_id)
+    if not job:
+        return {"error": "Không tìm thấy job"}
+    if backup_flags.get(job_id):
+        return {"error": "Job đang chạy, hãy pause trước khi retry lỗi"}
+    retried = queue_requeue_errors(job_id, retryable_only=retryable_only, max_attempt_count=5)
+    mode = "retryable" if retryable_only else "all"
+    record_job_log(job_id, "info", "retry", f"Manual retry errors mode={mode} count={retried}")
+    return {"ok": True, "retried": retried, "mode": mode}
 
 
 @router.post("/update/{job_id}")

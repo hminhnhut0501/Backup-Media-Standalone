@@ -145,6 +145,8 @@
         </div>
         <div class="actions">
           <button @click="run(selectedJob.id)" class="tv-btn tv-btn-success">Run</button>
+          <button @click="retryErrors(selectedJob.id, true)" class="tv-btn tv-btn-info">Retry lỗi tạm</button>
+          <button @click="retryErrors(selectedJob.id, false)" class="tv-btn tv-btn-secondary">Retry tất cả lỗi</button>
           <button @click="pause(selectedJob.id)" class="tv-btn tv-btn-warning">Pause</button>
           <button @click="drawerOpen=false" class="tv-btn tv-btn-secondary">Đóng</button>
         </div>
@@ -160,7 +162,7 @@
       </div>
 
       <div class="drawer-body custom-scroll">
-        <div x-show="drawerTab!=='settings' && drawerTab!=='logs'" style="display:none">
+        <div x-show="drawerTab!=='settings' && drawerTab!=='logs' && drawerTab!=='error_logs'" style="display:none">
           <div class="kpi-grid small">
             <article class="kpi-card"><p>State</p><strong x-text="selectedJob?.status || '-' "></strong></article>
             <article class="kpi-card"><p>Processed</p><strong x-text="selectedJob?.processed_count || 0"></strong></article>
@@ -218,7 +220,11 @@
         <div x-show="drawerTab==='error_logs'" style="display:none" class="panel-soft">
           <div class="list-head">
             <p>Lỗi chi tiết</p>
-            <button @click="selectedJob && Promise.all([loadLogs(selectedJob.id), loadTelemetry(selectedJob.id), loadQueueItems(selectedJob.id)])" class="tv-btn tv-btn-secondary">Làm mới</button>
+            <div class="actions">
+              <button @click="selectedJob && retryErrors(selectedJob.id, true)" class="tv-btn tv-btn-info">Retry lỗi tạm</button>
+              <button @click="selectedJob && retryErrors(selectedJob.id, false)" class="tv-btn tv-btn-secondary">Retry tất cả</button>
+              <button @click="selectedJob && Promise.all([loadLogs(selectedJob.id), loadTelemetry(selectedJob.id), loadQueueItems(selectedJob.id)])" class="tv-btn tv-btn-secondary">Làm mới</button>
+            </div>
           </div>
           <div class="queue-list">
             <template x-if="errorLogs.length===0"><p class="empty">Chưa có lỗi chi tiết cho job này.</p></template>
@@ -487,6 +493,17 @@ document.addEventListener('alpine:init', () => {
         async run(id){ const r=await fetch(`/api/backup/run/${id}`,{method:'POST'}); const d=await r.json(); if(d.error) alert(d.error); await this.refresh(); },
         async resume(id){ const r=await fetch(`/api/backup/resume/${id}`,{method:'POST'}); const d=await r.json(); if(d.error) alert(d.error); await this.refresh(); },
         async pause(id){ await fetch(`/api/backup/pause/${id}`,{method:'POST'}); await this.refresh(); },
+        async retryErrors(id, retryableOnly=true){
+            const qs = retryableOnly ? 'true' : 'false';
+            const r = await fetch(`/api/backup/retry_errors/${id}?retryable_only=${qs}`,{method:'POST'});
+            const d = await r.json();
+            if(d.error) return alert(d.error);
+            alert(`Đã đưa ${d.retried || 0} task lỗi về hàng đợi.`);
+            await this.refresh();
+            await this.loadQueueItems(id);
+            await this.loadLogs(id);
+            await this.loadTelemetry(id);
+        },
         async reset(id){ if(!confirm('Reset tiến trình job này?')) return; await fetch(`/api/backup/reset/${id}`,{method:'POST'}); await this.refresh(); },
         async remove(id){ if(!confirm('Xoá job backup này?')) return; await fetch(`/api/backup/delete/${id}`,{method:'DELETE'}); await this.refresh(); },
         async cleanup(){ const r=await fetch('/api/backup/cleanup',{method:'POST'}); const d=await r.json(); alert(`Đã xoá ${d.removed || 0} file tạm.`); },
