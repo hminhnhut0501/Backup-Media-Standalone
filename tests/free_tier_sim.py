@@ -156,7 +156,7 @@ class FreeTierSimulationTests(unittest.TestCase):
         async def run_case():
             self.mod.backup_flags[self.job_id] = True
             self.mod.backup_runtime[self.job_id] = {}
-            return await self.mod.download_media_with_fallback(self.job_id, FakeClient(), msg, dst, True)
+            return await self.mod.download_media_with_fallback(self.job_id, FakeClient(), None, msg, dst, True)
 
         result = asyncio.run(run_case())
         self.assertEqual(result, dst)
@@ -185,11 +185,52 @@ class FreeTierSimulationTests(unittest.TestCase):
             self.mod.backup_flags[self.job_id] = True
             self.mod.backup_runtime[self.job_id] = {}
             with patch.object(self.mod, "DEFAULT_DOWNLOAD_RETRIES", 2):
-                return await self.mod.download_media_with_fallback(self.job_id, client, msg, dst, False)
+                return await self.mod.download_media_with_fallback(self.job_id, client, None, msg, dst, False)
 
         result = asyncio.run(run_case())
         self.assertEqual(result, dst)
         self.assertEqual(client.calls, 2)
+        self.assertEqual(os.path.getsize(dst), len(payload))
+
+    def test_download_refreshes_expired_file_reference(self):
+        dst = str(Path(self.tmp.name) / "fresh-ref.bin")
+        payload = b"z" * 1024
+        stale = SimpleNamespace(id=6321, media="stale", file=SimpleNamespace(size=len(payload)))
+        fresh = SimpleNamespace(id=6321, media="fresh", file=SimpleNamespace(size=len(payload)))
+        source = object()
+
+        class FakeClient:
+            def __init__(self):
+                self.refreshed = False
+
+            async def iter_download(self, media, request_size):
+                raise RuntimeError("The file reference has expired and is no longer valid")
+                if False:
+                    yield b""
+
+            async def get_messages(self, entity, ids):
+                self.refreshed = True
+                assert entity is source
+                assert ids == 6321
+                return fresh
+
+            async def download_media(self, media, file, progress_callback):
+                assert media is fresh
+                with open(file, "wb") as fh:
+                    fh.write(payload)
+                await progress_callback(len(payload), len(payload))
+                return file
+
+        client = FakeClient()
+
+        async def run_case():
+            self.mod.backup_flags[self.job_id] = True
+            self.mod.backup_runtime[self.job_id] = {}
+            return await self.mod.download_media_with_fallback(self.job_id, client, source, stale, dst, True)
+
+        result = asyncio.run(run_case())
+        self.assertEqual(result, dst)
+        self.assertTrue(client.refreshed)
         self.assertEqual(os.path.getsize(dst), len(payload))
 
 

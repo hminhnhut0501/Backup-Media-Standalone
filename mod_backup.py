@@ -972,9 +972,15 @@ def validate_downloaded_file(path: str, expected_bytes: int = 0):
         raise RuntimeError(f"download_size_mismatch:expected={expected_bytes}:actual={actual}")
 
 
-async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_download: bool):
+def is_file_reference_expired(err: Exception | str) -> bool:
+    text = str(err).lower()
+    return "file reference has expired" in text or "filereference" in text
+
+
+async def download_media_with_fallback(job_id: int, client, source, msg, dst: str, fast_download: bool):
     msg_id = int(getattr(msg, "id", 0) or 0)
     total_bytes = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    current_msg = msg
     errors = []
 
     async def progress(cur, total, start_ts):
@@ -992,6 +998,18 @@ async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_
         except Exception:
             pass
 
+    async def refresh_message_reference():
+        nonlocal current_msg, total_bytes
+        if not source or not msg_id:
+            return False
+        fresh = await asyncio.wait_for(client.get_messages(source, ids=msg_id), timeout=DEFAULT_FETCH_TIMEOUT)
+        if not fresh:
+            return False
+        current_msg = fresh
+        total_bytes = int(getattr(getattr(current_msg, "file", None), "size", 0) or total_bytes or 0)
+        record_job_log(job_id, "info", "download", "Refreshed Telegram file reference", msg_id)
+        return True
+
     try:
         for attempt in range(1, max(1, DEFAULT_DOWNLOAD_RETRIES) + 1):
             methods = ["fast", "standard"] if fast_download else ["standard"]
@@ -1004,7 +1022,7 @@ async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_
                             downloaded = 0
                             req_size = FAST_ITER_REQUEST_MB * 1024 * 1024
                             with open(dst, "wb") as fh:
-                                async for chunk in client.iter_download(msg.media, request_size=req_size):
+                                async for chunk in client.iter_download(current_msg.media, request_size=req_size):
                                     if not backup_flags.get(job_id):
                                         raise asyncio.CancelledError("paused")
                                     if not chunk:
@@ -1022,7 +1040,7 @@ async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_
 
                     result_path = await asyncio.wait_for(
                         client.download_media(
-                            msg.media,
+                            current_msg,
                             file=dst,
                             progress_callback=standard_progress,
                         ),
@@ -1039,6 +1057,10 @@ async def download_media_with_fallback(job_id: int, client, msg, dst: str, fast_
                     errors.append(f"{method}#{attempt}:{normalize_short_error(e)}")
                     record_job_log(job_id, "warn", "download", errors[-1], msg_id)
                     await clear_partial()
+                    if is_file_reference_expired(e) and await refresh_message_reference():
+                        if method == "standard" and attempt < max(1, DEFAULT_DOWNLOAD_RETRIES):
+                            await sleep_with_pause_check(job_id, 1)
+                        continue
                     if method == "fast":
                         continue
                     if attempt < max(1, DEFAULT_DOWNLOAD_RETRIES):
@@ -1480,7 +1502,7 @@ async def run_backup(job_id: int):
                     ext = (getattr(getattr(msg, "file", None), "ext", None) or "bin").lstrip(".")
                     downloaded = path_for(job_id, msg_id, f"src.{ext}")
                     tmp_files.append(downloaded)
-                    downloaded = await download_media_with_fallback(job_id, client, msg, downloaded, fast_download)
+                    downloaded = await download_media_with_fallback(job_id, client, source, msg, downloaded, fast_download)
                     if not downloaded or not os.path.exists(downloaded) or os.path.getsize(downloaded) == 0:
                         raise RuntimeError("download_empty_or_failed")
                     queue_sub_progress(job_id, msg_id, "download", 42)
@@ -1649,7 +1671,7 @@ async def run_backup(job_id: int):
                     ext = (getattr(getattr(m, "file", None), "ext", None) or "bin").lstrip(".")
                     src_path = path_for(job_id, mid, f"src.{ext}")
                     tmp_files.append(src_path)
-                    downloaded = await download_media_with_fallback(job_id, client, m, src_path, fast_download)
+                    downloaded = await download_media_with_fallback(job_id, client, source, m, src_path, fast_download)
                     if not downloaded or not os.path.exists(downloaded) or os.path.getsize(downloaded) == 0:
                         raise RuntimeError(f"download_empty_or_failed:{mid}")
                     queue_sub_progress(job_id, mid, "download", 42)
